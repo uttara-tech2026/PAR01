@@ -1,6 +1,7 @@
 import os
 import re
 import io
+import time
 import random
 import hashlib
 import asyncio
@@ -68,6 +69,226 @@ class EditorStates(StatesGroup):
 
 class FlezenStates(StatesGroup):
     waiting_for_post = State()
+
+# ---------------------------------------------------------------------------
+# LIVE UPLOAD RATE-LIMITING & MESSAGE DEDUPLICATION MANAGER
+# ---------------------------------------------------------------------------
+class LiveUploadManager:
+    """Manages throttled updates and message cleanup for batch uploads."""
+    def __init__(self):
+        self.lock = asyncio.Lock()
+        self.sessions: dict[int, dict] = {}
+        self.dup_channel_msgs: dict[int, int] = {}
+        self.dup_user_msgs: dict[int, int] = {}
+
+    def init_session(self, link_id: int, user_id: int, chat_id: int, nick: str, count: int, user_msg_id: int):
+        self.sessions[link_id] = {
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "nick": nick,
+            "count": count,
+            "last_channel_update": 0.0,
+            "last_user_update": 0.0,
+            "channel_msg_id": None,
+            "user_msg_ids": [user_msg_id] if user_msg_id else [],
+            "channel_task": None,
+            "user_task": None,
+            "pending_channel": False,
+            "pending_user": False
+        }
+
+    async def record_upload(self, bot: Bot, link_id: int, user_id: int, chat_id: int, nick: str, new_count: int):
+        async with self.lock:
+            if link_id not in self.sessions:
+                self.sessions[link_id] = {
+                    "user_id": user_id,
+                    "chat_id": chat_id,
+                    "nick": nick,
+                    "count": new_count,
+                    "last_channel_update": 0.0,
+                    "last_user_update": 0.0,
+                    "channel_msg_id": None,
+                    "user_msg_ids": [],
+                    "channel_task": None,
+                    "user_task": None,
+                    "pending_channel": False,
+                    "pending_user": False
+                }
+            sess = self.sessions[link_id]
+            sess["count"] = new_count
+            sess["nick"] = nick
+
+            now = time.time()
+
+            # 1. Throttle Notification Log Channel (every 1.5s)
+            if now - sess["last_channel_update"] >= 1.5:
+                await self._dispatch_channel_log(bot, link_id)
+            else:
+                sess["pending_channel"] = True
+                if not sess["channel_task"] or sess["channel_task"].done():
+                    sess["channel_task"] = asyncio.create_task(self._delayed_channel_worker(bot, link_id))
+
+            # 2. Throttle Uploader Chat message (every 1.5s)
+            if now - sess["last_user_update"] >= 1.5:
+                await self._dispatch_user_counter(bot, link_id)
+            else:
+                sess["pending_user"] = True
+                if not sess["user_task"] or sess["user_task"].done():
+                    sess["user_task"] = asyncio.create_task(self._delayed_user_worker(bot, link_id))
+
+    async def _delayed_channel_worker(self, bot: Bot, link_id: int):
+        await asyncio.sleep(1.5)
+        async with self.lock:
+            if link_id in self.sessions and self.sessions[link_id]["pending_channel"]:
+                await self._dispatch_channel_log(bot, link_id)
+
+    async def _delayed_user_worker(self, bot: Bot, link_id: int):
+        await asyncio.sleep(1.5)
+        async with self.lock:
+            if link_id in self.sessions and self.sessions[link_id]["pending_user"]:
+                await self._dispatch_user_counter(bot, link_id)
+
+    async def _dispatch_channel_log(self, bot: Bot, link_id: int):
+        sess = self.sessions.get(link_id)
+        if not sess:
+            return
+        sess["pending_channel"] = False
+        sess["last_channel_update"] = time.time()
+
+        log_channel = await get_setting("notification_log_channel", "") or os.getenv("NOTIFICATION_LOG_CHANNEL", "")
+        if not log_channel:
+            return
+
+        target_chat = int(log_channel) if log_channel.lstrip('-').isdigit() else log_channel
+        text = (
+            f"📹 <b>[Live Upload In Progress]</b>\n"
+            f"• <b>Uploader:</b> {sess['nick']} (<code>{sess['user_id']}</code>)\n"
+            f"• <b>Link ID:</b> <code>#{link_id}</code>\n"
+            f"• <b>Total Videos Uploaded:</b> <code>{sess['count']}</code>"
+        )
+
+        old_msg_id = sess["channel_msg_id"]
+        if old_msg_id:
+            try:
+                await bot.edit_message_text(chat_id=target_chat, message_id=old_msg_id, text=text, parse_mode="HTML")
+                return
+            except Exception:
+                try:
+                    await bot.delete_message(chat_id=target_chat, message_id=old_msg_id)
+                except Exception:
+                    pass
+
+        try:
+            new_msg = await bot.send_message(chat_id=target_chat, text=text, parse_mode="HTML")
+            sess["channel_msg_id"] = new_msg.message_id
+        except Exception as e:
+            logging.error(f"Error sending log channel update: {e}")
+
+    async def _dispatch_user_counter(self, bot: Bot, link_id: int):
+        sess = self.sessions.get(link_id)
+        if not sess:
+            return
+        sess["pending_user"] = False
+        sess["last_user_update"] = time.time()
+
+        task_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Done Uploading All Videos", callback_data="uploader_done")],
+            [InlineKeyboardButton(text="⚠️ Link Expired (Report to Admin)", callback_data=f"uploader_expired:{link_id}")]
+        ])
+
+        # Delete older counter messages in uploader chat
+        old_ids = sess["user_msg_ids"][:]
+        sess["user_msg_ids"] = []
+        for oid in old_ids:
+            try:
+                await bot.delete_message(chat_id=sess["chat_id"], message_id=oid)
+            except Exception:
+                pass
+
+        try:
+            new_msg = await bot.send_message(
+                chat_id=sess["chat_id"],
+                text=f"📹 <b>Video uploaded for this link count:</b> <code>{sess['count']}</code>\n<i>(Send all videos, then tap Done or send /done)</i>",
+                reply_markup=task_kb,
+                parse_mode="HTML"
+            )
+            sess["user_msg_ids"].append(new_msg.message_id)
+        except Exception as e:
+            logging.error(f"Error updating uploader counter: {e}")
+
+    async def log_duplicate_attempt(self, bot: Bot, link_id: int, user_id: int, nick: str, chat_id: int):
+        async with self.lock:
+            prev_dup_id = self.dup_channel_msgs.get(link_id)
+            log_channel = await get_setting("notification_log_channel", "") or os.getenv("NOTIFICATION_LOG_CHANNEL", "")
+            if log_channel and prev_dup_id:
+                target_log = int(log_channel) if log_channel.lstrip('-').isdigit() else log_channel
+                try:
+                    await bot.delete_message(chat_id=target_log, message_id=prev_dup_id)
+                except Exception:
+                    pass
+
+            notif_msg = await send_notification_log(
+                bot,
+                f"⚠️ <b>[Duplicate Video Attempt Flagged]</b>\n"
+                f"• <b>Uploader:</b> {nick} (<code>{user_id}</code>)\n"
+                f"• <b>Link ID:</b> <code>#{link_id}</code>\n"
+                f"• Video upload rejected automatically."
+            )
+            if notif_msg:
+                self.dup_channel_msgs[link_id] = notif_msg.message_id
+
+            prev_user_dup = self.dup_user_msgs.get(user_id)
+            if prev_user_dup:
+                try:
+                    await bot.delete_message(chat_id=chat_id, message_id=prev_user_dup)
+                except Exception:
+                    pass
+
+            try:
+                warn = await bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ <b>Duplicate detected:</b> This video has already been uploaded! Skipped.",
+                    parse_mode="HTML"
+                )
+                self.dup_user_msgs[user_id] = warn.message_id
+            except Exception:
+                pass
+
+    async def finalize_task(self, bot: Bot, link_id: int, chat_id: int):
+        async with self.lock:
+            sess = self.sessions.pop(link_id, None)
+            if sess:
+                if sess["channel_task"]:
+                    sess["channel_task"].cancel()
+                if sess["user_task"]:
+                    sess["user_task"].cancel()
+
+                if sess["channel_msg_id"]:
+                    log_channel = await get_setting("notification_log_channel", "") or os.getenv("NOTIFICATION_LOG_CHANNEL", "")
+                    if log_channel:
+                        target_log = int(log_channel) if log_channel.lstrip('-').isdigit() else log_channel
+                        try:
+                            await bot.delete_message(chat_id=target_log, message_id=sess["channel_msg_id"])
+                        except Exception:
+                            pass
+
+                for uid in sess["user_msg_ids"]:
+                    try:
+                        await bot.delete_message(chat_id=chat_id, message_id=uid)
+                    except Exception:
+                        pass
+
+            dup_chan_id = self.dup_channel_msgs.pop(link_id, None)
+            if dup_chan_id:
+                log_channel = await get_setting("notification_log_channel", "") or os.getenv("NOTIFICATION_LOG_CHANNEL", "")
+                if log_channel:
+                    target_log = int(log_channel) if log_channel.lstrip('-').isdigit() else log_channel
+                    try:
+                        await bot.delete_message(chat_id=target_log, message_id=dup_chan_id)
+                    except Exception:
+                        pass
+
+upload_manager = LiveUploadManager()
 
 # ---------------------------------------------------------------------------
 # URL FORMATTER HELPER
@@ -252,6 +473,14 @@ async def init_db():
             await conn.execute("ALTER TABLE editor_tasks ADD COLUMN IF NOT EXISTS video_title TEXT;")
             await conn.execute("ALTER TABLE editor_tasks ADD COLUMN IF NOT EXISTS submitted_at TIMESTAMPTZ;")
             await conn.execute("ALTER TABLE editor_tasks ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;")
+
+            # Automatically rescue existing stuck videos into the sorter queue
+            await conn.execute("""
+                UPDATE videos
+                SET status = 'pending_sort'
+                WHERE status = 'pending_broadcast'
+                  AND link_id IN (SELECT id FROM links WHERE status = 'completed');
+            """)
         except Exception as e:
             logging.warning(f"Migration note: {e}")
 
@@ -414,7 +643,7 @@ def get_verifier_reply_kb():
     )
 
 # ---------------------------------------------------------------------------
-# WORKFLOW TASK ROUTINES (DEFINED FIRST TO PREVENT NameError)
+# WORKFLOW TASK ROUTINES
 # ---------------------------------------------------------------------------
 async def start_uploader_task(user_id: int, message: Message, state: FSMContext, bot: Bot):
     role = await get_employee_role(user_id)
@@ -462,9 +691,7 @@ async def start_uploader_task(user_id: int, message: Message, state: FSMContext,
     await state.set_state(UploaderStates.uploading_videos)
     await state.update_data(
         link_id=link_id,
-        count=curr_count,
-        last_counter_msg_id=None,
-        last_notif_upload_msg_id=None
+        count=curr_count
     )
 
     task_kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -481,12 +708,15 @@ async def start_uploader_task(user_id: int, message: Message, state: FSMContext,
         f'🔗 <b>Link:</b> <a href="{clickable_task_url}"><b>{clickable_task_url}</b></a>\n'
         f"📁 <b>Type:</b> <code>{link_type}</code>\n\n"
         "<i>(This link is locked exclusively to you until completed or reported expired)</i>\n\n"
-        "Please download/forward all videos from this link and send them directly into this chat.\n\n"
+        "Please download/forward all videos from this link and send them directly into this chat.\n"
+        "<i>When finished, tap Done or send <b>/done</b>.</i>\n\n"
         f"📹 <b>Videos uploaded for this link count:</b> <code>{curr_count}</code>",
         reply_markup=task_kb,
         parse_mode="HTML"
     )
-    await state.update_data(last_counter_msg_id=sent_msg.message_id)
+
+    nick = await fetchval("SELECT nickname FROM employees WHERE user_id = $1", user_id) or "Uploader"
+    upload_manager.init_session(link_id, user_id, message.chat.id, nick, curr_count, sent_msg.message_id)
 
 async def start_editor_task(user_id: int, message: Message, state: FSMContext, bot: Bot):
     task = await fetchrow(
@@ -530,10 +760,7 @@ async def start_editor_task(user_id: int, message: Message, state: FSMContext, b
     elif task["ref_type"] == "document":
         await message.answer_document(document=task["ref_content"], caption=prompt_caption, parse_mode="HTML")
     else:
-        await message.answer(f"🔗 <b>Reference Content:</b>\n{task['ref_content']}\n\n{prompt_caption}", parse_mode="HTML")
-
-# Function aliases to prevent NameError
-msg_editor_start_task = start_editor_task
+        await message.answer(f"🔗 <b>Reference Content / Link:</b>\n{task['ref_content']}\n\n{prompt_caption}", parse_mode="HTML")
 
 async def build_sorter_category_kb(vid_id: int) -> InlineKeyboardMarkup:
     recent_cats = await fetch("SELECT name FROM categories ORDER BY last_used_at DESC NULLS LAST, use_count DESC LIMIT 2")
@@ -588,8 +815,6 @@ async def sorter_fetch_next_task(user_id: int, message: Message, state: FSMConte
         reply_markup=kb,
         parse_mode="HTML"
     )
-
-msg_sorter_start_task = sorter_fetch_next_task
 
 # ---------------------------------------------------------------------------
 # GENERAL EMPLOYEE START TASK ROUTER
@@ -735,7 +960,7 @@ async def cb_set_chat_dest(call: CallbackQuery, bot: Bot):
     await call.answer("Destination linked successfully!")
 
 # ---------------------------------------------------------------------------
-# BACKGROUND BROADCASTER
+# BACKGROUND BROADCASTER (DECOUPLED FROM SORTER QUEUE)
 # ---------------------------------------------------------------------------
 async def broadcast_worker(bot: Bot):
     while True:
@@ -743,86 +968,86 @@ async def broadcast_worker(bot: Bot):
             dests = await fetch("SELECT id, target_chat, custom_delay FROM destinations WHERE layer_type = 'prelayered' ORDER BY id ASC")
             
             if dests:
-                mode = await get_setting("delay_mode", "fixed")
-                fixed_delay = int(await get_setting("fixed_delay", "60"))
-                rnd_min = int(await get_setting("random_min", "30"))
-                rnd_max = int(await get_setting("random_max", "120"))
+                video_row = await fetchrow("""
+                    SELECT v.id, v.file_id, v.link_id, l.category, l.video_count 
+                    FROM videos v
+                    JOIN links l ON v.link_id = l.id
+                    WHERE v.posted_at IS NULL AND l.status = 'completed'
+                    ORDER BY v.id ASC 
+                    LIMIT 1
+                """)
 
-                for d in dests:
-                    target_chat = d["target_chat"]
-                    custom_delay = d["custom_delay"]
+                if video_row:
+                    vid_id = video_row["id"]
+                    file_id = video_row["file_id"]
+                    link_id = video_row["link_id"]
+                    total_vids = video_row["video_count"] or 1
+                    category_caption = video_row["category"] or ""
 
-                    video_row = await fetchrow("""
-                        SELECT v.id, v.file_id, v.link_id, l.category, l.video_count 
-                        FROM videos v
-                        JOIN links l ON v.link_id = l.id
-                        WHERE v.status = 'pending_broadcast' AND l.status = 'completed'
-                        ORDER BY v.id ASC 
-                        LIMIT 1
-                    """)
+                    mode = await get_setting("delay_mode", "fixed")
+                    fixed_delay = int(await get_setting("fixed_delay", "60"))
+                    rnd_min = int(await get_setting("random_min", "30"))
+                    rnd_max = int(await get_setting("random_max", "120"))
 
-                    if video_row:
-                        vid_id = video_row["id"]
-                        file_id = video_row["file_id"]
-                        link_id = video_row["link_id"]
-                        total_vids = video_row["video_count"] or 1
-                        category_caption = video_row["category"] or ""
-
+                    max_custom_delay = None
+                    for d in dests:
+                        target_chat = d["target_chat"]
+                        c_delay = d["custom_delay"]
+                        if c_delay and (max_custom_delay is None or c_delay > max_custom_delay):
+                            max_custom_delay = c_delay
                         try:
                             chat_id = int(target_chat) if target_chat.lstrip('-').isdigit() else target_chat
                             await bot.send_video(chat_id=chat_id, video=file_id, caption=category_caption)
-                            await execute("UPDATE videos SET status = 'pending_sort', posted_at = NOW() WHERE id = $1", vid_id)
-
-                            posted_count = await fetchval(
-                                "SELECT COUNT(*) FROM videos WHERE link_id = $1 AND (status = 'pending_sort' OR status = 'sorted')",
-                                link_id
-                            ) or 1
-
-                            log_channel = await get_setting("notification_log_channel", "") or os.getenv("NOTIFICATION_LOG_CHANNEL", "")
-                            if log_channel:
-                                target_log_chat = int(log_channel) if log_channel.lstrip('-').isdigit() else log_channel
-                                tracker_key = f"{target_chat}:{category_caption}"
-                                prev_msg_id = broadcast_notif_tracker.get(tracker_key)
-
-                                if prev_msg_id:
-                                    try:
-                                        await bot.delete_message(chat_id=target_log_chat, message_id=prev_msg_id)
-                                    except Exception:
-                                        pass
-
-                                if posted_count < total_vids:
-                                    notif_text = (
-                                        f"📢 <b>[Prelayered Broadcast Progress]</b>\n"
-                                        f"• <b>Destination:</b> <code>{target_chat}</code>\n"
-                                        f"• <b>Caption:</b> <code>{category_caption}</code>\n"
-                                        f"• <b>Progress:</b> <code>{posted_count} / {total_vids} videos</code>"
-                                    )
-                                else:
-                                    notif_text = (
-                                        f"📢 <b>[Prelayered Broadcast Completed]</b>\n"
-                                        f"• <b>Destination:</b> <code>{target_chat}</code>\n"
-                                        f"• <b>Caption:</b> <code>{category_caption}</code>\n"
-                                        f"• <b>Total Videos:</b> <code>{total_vids}</code> (Ready for Sorters)"
-                                    )
-
-                                sent_notif = await send_notification_log(bot, notif_text)
-                                if sent_notif:
-                                    if posted_count < total_vids:
-                                        broadcast_notif_tracker[tracker_key] = sent_notif.message_id
-                                    else:
-                                        broadcast_notif_tracker.pop(tracker_key, None)
-
                         except Exception as send_err:
                             logging.error(f"Broadcast error on {target_chat}: {send_err}")
 
-                        sleep_duration = custom_delay if (custom_delay and custom_delay > 0) else (
-                            random.randint(rnd_min, rnd_max) if mode == "random" else fixed_delay
-                        )
-                        await asyncio.sleep(sleep_duration)
-                    else:
-                        break
+                    await execute("UPDATE videos SET posted_at = NOW() WHERE id = $1", vid_id)
 
-            await asyncio.sleep(10)
+                    posted_count = await fetchval(
+                        "SELECT COUNT(*) FROM videos WHERE link_id = $1 AND posted_at IS NOT NULL",
+                        link_id
+                    ) or 1
+
+                    log_channel = await get_setting("notification_log_channel", "") or os.getenv("NOTIFICATION_LOG_CHANNEL", "")
+                    if log_channel:
+                        target_log_chat = int(log_channel) if log_channel.lstrip('-').isdigit() else log_channel
+                        tracker_key = f"prelayered:{link_id}"
+                        prev_msg_id = broadcast_notif_tracker.get(tracker_key)
+
+                        if prev_msg_id:
+                            try:
+                                await bot.delete_message(chat_id=target_log_chat, message_id=prev_msg_id)
+                            except Exception:
+                                pass
+
+                        if posted_count < total_vids:
+                            notif_text = (
+                                f"📢 <b>[Prelayered Broadcast Progress]</b>\n"
+                                f"• <b>Caption:</b> <code>{category_caption}</code>\n"
+                                f"• <b>Progress:</b> <code>{posted_count} / {total_vids} videos</code>"
+                            )
+                        else:
+                            notif_text = (
+                                f"📢 <b>[Prelayered Broadcast Completed]</b>\n"
+                                f"• <b>Caption:</b> <code>{category_caption}</code>\n"
+                                f"• <b>Total Videos:</b> <code>{total_vids}</code>"
+                            )
+
+                        sent_notif = await send_notification_log(bot, notif_text)
+                        if sent_notif:
+                            if posted_count < total_vids:
+                                broadcast_notif_tracker[tracker_key] = sent_notif.message_id
+                            else:
+                                broadcast_notif_tracker.pop(tracker_key, None)
+
+                    sleep_duration = max_custom_delay if (max_custom_delay and max_custom_delay > 0) else (
+                        random.randint(rnd_min, rnd_max) if mode == "random" else fixed_delay
+                    )
+                    await asyncio.sleep(sleep_duration)
+                else:
+                    await asyncio.sleep(10)
+            else:
+                await asyncio.sleep(10)
         except Exception as loop_err:
             logging.error(f"Broadcast worker loop error: {loop_err}")
             await asyncio.sleep(10)
@@ -867,7 +1092,6 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
         await message.answer("👋 <b>Welcome Verifier!</b>\nVideos sent to 2nd Layer will be verified using action buttons.", reply_markup=get_verifier_reply_kb(), parse_mode="HTML")
         return
 
-    # Unknown user request flow
     username = message.from_user.username or ""
     full_name = message.from_user.full_name or "Telegram User"
 
@@ -1001,7 +1225,6 @@ async def process_editor_submission_title(message: Message, state: FSMContext, b
         parse_mode="HTML"
     )
 
-# Dedicated status report for editors
 @router.message(StateFilter("*"), F.text.in_(["📊 Status", "📊 My Editor Stats", "Status"]))
 async def msg_editor_status_report(message: Message):
     user_id = message.from_user.id
@@ -1130,7 +1353,6 @@ async def flezen_auto_post_handler(message: Message, bot: Bot):
     is_duplicate = await fetchval("SELECT 1 FROM flezen_posts WHERE file_unique_id = $1", unique_key)
     if is_duplicate:
         await execute("INSERT INTO duplicate_logs (user_id, created_at) VALUES ($1, NOW())", user_id)
-        
         warn = await message.reply("⚠️ <b>Duplicate Detected:</b> This post was already submitted before! Skipped.", parse_mode="HTML")
         await asyncio.sleep(3)
         try:
@@ -1808,6 +2030,8 @@ async def cb_uploader_expired(call: CallbackQuery, state: FSMContext, bot: Bot):
         user_id, link_id
     )
 
+    await upload_manager.finalize_task(bot, link_id, call.message.chat.id)
+
     link_data = await fetchrow("SELECT url, link_type FROM links WHERE id = $1", link_id)
     url_str = link_data["url"] if link_data else "Unknown URL"
     uploader_nick = await fetchval("SELECT nickname FROM employees WHERE user_id = $1", user_id) or f"ID {user_id}"
@@ -1925,85 +2149,65 @@ async def process_video_upload(message: Message, state: FSMContext, bot: Bot):
     if not link_id:
         return await message.answer("⚠️ Session expired. Please click ▶️ Start Task again.")
 
+    nick = await fetchval("SELECT nickname FROM employees WHERE user_id = $1", user_id) or "Uploader"
+
+    # Deduplication check
     is_duplicate = await fetchval("SELECT 1 FROM videos WHERE file_unique_id = $1", file_unique_id)
     if is_duplicate:
         await execute("INSERT INTO duplicate_logs (user_id, created_at) VALUES ($1, NOW())", user_id)
-        
-        nick = await fetchval("SELECT nickname FROM employees WHERE user_id = $1", user_id) or "Uploader"
-        await send_notification_log(
-            bot,
-            f"⚠️ <b>[Duplicate Video Attempt Flagged]</b>\n"
-            f"• <b>Uploader:</b> {nick} (<code>{user_id}</code>)\n"
-            f"• <b>Link ID:</b> <code>#{link_id}</code>\n"
-            f"• Video upload rejected automatically."
-        )
-
-        warning = await message.reply("⚠️ Duplicate detected: This video has already been uploaded! Skipped.")
-        await asyncio.sleep(3)
-        try:
-            await warning.delete()
-            await message.delete()
-        except Exception:
-            pass
+        await upload_manager.log_duplicate_attempt(bot, link_id, user_id, nick, message.chat.id)
         return
 
+    # Valid video upload - saved with posted_at = NULL
     await execute(
         "INSERT INTO videos (link_id, uploader_id, file_id, file_unique_id, caption, status, created_at) VALUES ($1, $2, $3, $4, $5, 'pending_broadcast', NOW())",
         link_id, user_id, file_id, file_unique_id, caption
     )
     await execute("UPDATE links SET video_count = video_count + 1 WHERE id = $1", link_id)
     new_count = await fetchval("SELECT video_count FROM links WHERE id = $1", link_id)
+    await state.update_data(count=new_count)
 
-    last_notif_id = data.get("last_notif_upload_msg_id")
-    log_channel = await get_setting("notification_log_channel", "") or os.getenv("NOTIFICATION_LOG_CHANNEL", "")
-    if last_notif_id and log_channel:
-        try:
-            target_log_chat = int(log_channel) if log_channel.lstrip('-').isdigit() else log_channel
-            await bot.delete_message(chat_id=target_log_chat, message_id=last_notif_id)
-        except Exception:
-            pass
+    # Throttled update to both Notification Log and Uploader chat
+    await upload_manager.record_upload(bot, link_id, user_id, message.chat.id, nick, new_count)
 
-    nick = await fetchval("SELECT nickname FROM employees WHERE user_id = $1", user_id) or "Uploader"
-    notif_msg = await send_notification_log(
-        bot,
-        f"📹 <b>[Live Upload In Progress]</b>\n"
-        f"• <b>Uploader:</b> {nick} (<code>{user_id}</code>)\n"
-        f"• <b>Link ID:</b> <code>#{link_id}</code>\n"
-        f"• <b>Total Videos Uploaded:</b> <code>{new_count}</code>"
-    )
-    if notif_msg:
-        await state.update_data(last_notif_upload_msg_id=notif_msg.message_id)
-
-    last_msg_id = data.get("last_counter_msg_id")
-    if last_msg_id:
-        try:
-            await bot.delete_message(chat_id=message.chat.id, message_id=last_msg_id)
-        except Exception:
-            pass
-
-    task_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Done Uploading All Videos", callback_data="uploader_done")],
-        [InlineKeyboardButton(text="⚠️ Link Expired (Report to Admin)", callback_data=f"uploader_expired:{link_id}")]
-    ])
-
-    new_msg = await message.answer(
-        f"📹 <b>Video uploaded for this link count:</b> <code>{new_count}</code>",
-        reply_markup=task_kb,
-        parse_mode="HTML"
-    )
-    await state.update_data(count=new_count, last_counter_msg_id=new_msg.message_id)
-
-@router.callback_query(UploaderStates.uploading_videos, F.data == "uploader_done")
-async def process_uploader_done(call: CallbackQuery, state: FSMContext):
+# ---------------------------------------------------------------------------
+# FINISH UPLOAD HANDLERS (BUTTON OR /done COMMAND)
+# ---------------------------------------------------------------------------
+async def finish_uploader_upload(bot: Bot, state: FSMContext, chat_id: int, user_id: int):
     data = await state.get_data()
+    link_id = data.get("link_id")
     count = data.get("count", 0)
 
-    if count == 0:
-        return await call.answer("⚠️ You must upload at least 1 video before finishing this link!", show_alert=True)
+    if link_id:
+        actual_db_count = await fetchval("SELECT video_count FROM links WHERE id = $1", link_id) or 0
+        if actual_db_count > count:
+            count = actual_db_count
+            await state.update_data(count=count)
 
-    await call.message.edit_reply_markup(reply_markup=None)
-    await call.message.answer("📝 Please send the initial <b>Category Name</b> for these uploaded videos:", parse_mode="HTML")
+    if count == 0:
+        return await bot.send_message(chat_id=chat_id, text="⚠️ You must upload at least 1 video before finishing this link!")
+
+    await upload_manager.finalize_task(bot, link_id, chat_id)
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text="📝 Please send the initial <b>Category Name</b> for these uploaded videos:",
+        parse_mode="HTML"
+    )
     await state.set_state(UploaderStates.waiting_for_category)
+
+@router.callback_query(UploaderStates.uploading_videos, F.data == "uploader_done")
+async def process_uploader_done(call: CallbackQuery, state: FSMContext, bot: Bot):
+    await call.answer()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await finish_uploader_upload(bot, state, call.message.chat.id, call.from_user.id)
+
+@router.message(Command("done"), UploaderStates.uploading_videos)
+async def cmd_uploader_done(message: Message, state: FSMContext, bot: Bot):
+    await finish_uploader_upload(bot, state, message.chat.id, message.from_user.id)
 
 @router.message(UploaderStates.waiting_for_category)
 async def process_category_finish(message: Message, state: FSMContext, bot: Bot):
@@ -2022,19 +2226,20 @@ async def process_category_finish(message: Message, state: FSMContext, bot: Bot)
         category, user_id, count, link_id
     )
 
+    # Immediately queue all uploaded videos for Sorters
+    await execute(
+        """
+        UPDATE videos
+        SET status = 'pending_sort'
+        WHERE link_id = $1 AND (status = 'pending_broadcast' OR status = 'pending')
+        """,
+        link_id
+    )
+
     daily_count = await fetchval(
         "SELECT COUNT(*) FROM links WHERE completed_by = $1 AND completed_at::date = CURRENT_DATE",
         user_id
     )
-
-    last_notif_id = data.get("last_notif_upload_msg_id")
-    log_channel = await get_setting("notification_log_channel", "") or os.getenv("NOTIFICATION_LOG_CHANNEL", "")
-    if last_notif_id and log_channel:
-        try:
-            target_log_chat = int(log_channel) if log_channel.lstrip('-').isdigit() else log_channel
-            await bot.delete_message(chat_id=target_log_chat, message_id=last_notif_id)
-        except Exception:
-            pass
 
     nick = await fetchval("SELECT nickname FROM employees WHERE user_id = $1", user_id) or "Uploader"
     await send_notification_log(
@@ -2044,7 +2249,7 @@ async def process_category_finish(message: Message, state: FSMContext, bot: Bot)
         f"• <b>Link ID:</b> <code>#{link_id}</code>\n"
         f"• <b>Initial Category:</b> <code>{category}</code>\n"
         f"• <b>Total Videos:</b> <code>{count}</code>\n"
-        f"• <b>Status:</b> Queued for Prelayered Broadcast & Sorter"
+        f"• <b>Status:</b> Ready for Sorters & Queued for Prelayered Broadcast"
     )
 
     await state.clear()
@@ -2053,13 +2258,13 @@ async def process_category_finish(message: Message, state: FSMContext, bot: Bot)
         f"🏷️ <b>Category:</b> <code>{category}</code>\n"
         f"📹 <b>Videos Uploaded:</b> <code>{count}</code>\n"
         f"📅 <b>Total Links Completed Today:</b> <code>{daily_count}</code>\n\n"
-        "Your uploaded videos have been queued for prelayered broadcast and are now ready for the Sorters.",
+        "Your uploaded videos have been queued for the Sorters and scheduled for background prelayered broadcast.",
         reply_markup=get_uploader_reply_kb(),
         parse_mode="HTML"
     )
 
 # ---------------------------------------------------------------------------
-# ADMIN LINK CATEGORIZATION (WITH URGENT QUEUE BUTTON)
+# ADMIN LINK CATEGORIZATION
 # ---------------------------------------------------------------------------
 async def start_link_queue_flow(detected_raw_links: list[str], message: Message, state: FSMContext):
     seen = set()
@@ -2082,7 +2287,7 @@ async def start_link_queue_flow(detected_raw_links: list[str], message: Message,
     )
     await ask_link_categorization(message, state, duplicate_confirmed=False)
 
-@router.message(IsAdmin(), F.document, ~StateFilter(UploaderStates.uploading_videos, UploaderStates.waiting_for_category))
+@router.message(IsAdmin(), StateFilter(None), F.document)
 async def handle_document_links(message: Message, state: FSMContext, bot: Bot):
     if message.document.file_name and message.document.file_name.lower().endswith(".txt"):
         file_io = io.BytesIO()
@@ -2095,33 +2300,10 @@ async def handle_document_links(message: Message, state: FSMContext, bot: Bot):
             await message.reply(f"📄 Found <code>{len(matches)}</code> Telegram link(s) in uploaded file.", parse_mode="HTML")
             await start_link_queue_flow(matches, message, state)
 
-@router.message(
-    IsAdmin(),
-    ~StateFilter(UploaderStates.uploading_videos, UploaderStates.waiting_for_category),
-    F.text | F.caption
-)
+@router.message(IsAdmin(), StateFilter(None), F.text | F.caption)
 async def handle_text_or_caption_links(message: Message, state: FSMContext):
     text_content = message.text or message.caption or ""
     if text_content.startswith("/"):
-        return
-
-    current_state = await state.get_state()
-    if current_state in [
-        AdminStates.waiting_for_dest_target.state,
-        AdminStates.waiting_for_dest_custom_delay.state,
-        AdminStates.waiting_for_notif_channel.state,
-        AdminStates.waiting_for_new_category.state,
-        AdminStates.waiting_for_fixed_delay.state,
-        AdminStates.waiting_for_random_delay.state,
-        AdminStates.waiting_for_earning_rate.state,
-        AdminStates.waiting_for_emp_manual_add.state,
-        AdminStates.waiting_for_admin_id.state,
-        AdminStates.waiting_for_req_nickname.state,
-        AdminStates.waiting_for_editor_ref.state,
-        AdminStates.waiting_for_rejection_notes.state,
-        AdminStates.waiting_for_admin_self_edit.state,
-        AdminStates.waiting_for_reedit_title.state
-    ]:
         return
 
     matches = TG_LINK_REGEX.findall(text_content)
@@ -2317,12 +2499,12 @@ async def cb_admin_reports(call: CallbackQuery):
     pending_links = await fetchval("SELECT COUNT(*) FROM links WHERE status = 'pending'")
     urgent_pending = await fetchval("SELECT COUNT(*) FROM links WHERE status = 'pending' AND is_urgent = TRUE") or 0
     completed_links = await fetchval("SELECT COUNT(*) FROM links WHERE status = 'completed'")
-    pending_broadcast = await fetchval("SELECT COUNT(*) FROM videos WHERE status = 'pending_broadcast'")
-    pending_sort = await fetchval("SELECT COUNT(*) FROM videos WHERE status = 'pending_sort'")
-    sorted_vids = await fetchval("SELECT COUNT(*) FROM videos WHERE status = 'sorted'")
-    approved_edits = await fetchval("SELECT COUNT(*) FROM editor_tasks WHERE status = 'approved'")
-    flezen_count = await fetchval("SELECT COUNT(*) FROM flezen_posts")
-    connected_chats = await fetchval("SELECT COUNT(*) FROM bot_chats WHERE is_admin = TRUE")
+    pending_broadcast = await fetchval("SELECT COUNT(*) FROM videos v JOIN links l ON v.link_id = l.id WHERE v.posted_at IS NULL AND l.status = 'completed'") or 0
+    pending_sort = await fetchval("SELECT COUNT(*) FROM videos WHERE status = 'pending_sort'") or 0
+    sorted_vids = await fetchval("SELECT COUNT(*) FROM videos WHERE status = 'sorted'") or 0
+    approved_edits = await fetchval("SELECT COUNT(*) FROM editor_tasks WHERE status = 'approved'") or 0
+    flezen_count = await fetchval("SELECT COUNT(*) FROM flezen_posts") or 0
+    connected_chats = await fetchval("SELECT COUNT(*) FROM bot_chats WHERE is_admin = TRUE") or 0
 
     employees = await fetch("SELECT user_id, role, nickname FROM employees ORDER BY role ASC, user_id ASC")
 
@@ -2418,19 +2600,25 @@ async def cb_admin_add_editor_ref(call: CallbackQuery, state: FSMContext):
 
 @router.message(AdminStates.waiting_for_editor_ref)
 async def process_admin_editor_ref_input(message: Message, state: FSMContext, bot: Bot):
-    caption = message.caption or message.text or ""
+    caption = message.caption or ""
     ref_type = "text"
     ref_content = message.text or ""
 
     if message.photo:
         ref_type = "photo"
         ref_content = message.photo[-1].file_id
+        caption = message.caption or ""
     elif message.video:
         ref_type = "video"
         ref_content = message.video.file_id
+        caption = message.caption or ""
     elif message.document:
         ref_type = "document"
         ref_content = message.document.file_id
+        caption = message.caption or ""
+
+    if not ref_content and not caption:
+        return await message.answer("⚠️ Please provide reference text, a link, or a media file.")
 
     await execute(
         """
@@ -2441,11 +2629,13 @@ async def process_admin_editor_ref_input(message: Message, state: FSMContext, bo
     )
     await state.clear()
 
+    display_content = (ref_content[:60] + "...") if len(ref_content) > 60 else ref_content
     await send_notification_log(
         bot,
         f"🎬 <b>[New Editor Reference Task Queued]</b>\n"
         f"• <b>Admin:</b> <code>{message.from_user.id}</code>\n"
         f"• <b>Type:</b> <code>{ref_type.upper()}</code>\n"
+        f"• <b>Reference:</b> {display_content}\n"
         f"• <b>Instructions:</b> {caption if caption else 'None'}"
     )
 
@@ -2453,7 +2643,13 @@ async def process_admin_editor_ref_input(message: Message, state: FSMContext, bo
         [InlineKeyboardButton(text="🎬 Editor Hub", callback_data="admin_editor_hub")],
         [InlineKeyboardButton(text="👑 Admin Menu", callback_data="admin_menu")]
     ])
-    await message.answer("✅ <b>Reference Task Successfully Queued for Editors!</b>", reply_markup=kb, parse_mode="HTML")
+    await message.answer(
+        f"✅ <b>Reference Task Successfully Queued for Editors!</b>\n\n"
+        f"• <b>Type:</b> <code>{ref_type.upper()}</code>\n"
+        f"• <b>Reference:</b> {display_content}",
+        reply_markup=kb,
+        parse_mode="HTML"
+    )
 
 # ---------------------------------------------------------------------------
 # ADMIN REVIEW & EDIT DECISION LOGIC
@@ -3159,7 +3355,6 @@ async def cb_sort_pick(call: CallbackQuery, state: FSMContext, bot: Bot):
         return await call.answer("⚠️ Video record missing!", show_alert=True)
 
     file_id = video["file_id"]
-    prev_caption = video["caption"] or "None"
     new_caption = chosen_cat
 
     await execute(
@@ -3189,7 +3384,7 @@ async def cb_sort_pick(call: CallbackQuery, state: FSMContext, bot: Bot):
         f"• <b>Video ID:</b> <code>#{vid_id}</code>\n"
         f"• <b>Sorter:</b> {sorter_nick} (<code>{user_id}</code>)\n"
         f"• <b>Assigned Category:</b> <code>{chosen_cat}</code>\n"
-        f"• <b>Previous Caption:</b> <code>{prev_caption}</code>\n\n"
+        f"• <b>Previous Caption:</b> <code>{video['caption'] or 'None'}</code>\n\n"
         "👉 <i>Is this category correct or wrong? (Organizer / Verifier Only)</i>"
     )
     for sl in second_layers:
@@ -3489,226 +3684,3 @@ async def process_random_delay_input(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="👑 Admin Menu", callback_data="admin_menu")]
     ])
     await message.answer(f"✅ <b>Random Delay Configured!</b>\nRange: <code>{min_val}s - {max_val}s</code>", reply_markup=kb, parse_mode="HTML")
-
-# ---------------------------------------------------------------------------
-# LINK DETECTION & DUPLICATE CHECK
-# ---------------------------------------------------------------------------
-async def start_link_queue_flow(detected_raw_links: list[str], message: Message, state: FSMContext):
-    seen = set()
-    links = []
-    for l in detected_raw_links:
-        clean = l.strip()
-        if clean and clean not in seen:
-            seen.add(clean)
-            links.append(clean)
-
-    if not links:
-        return
-
-    await state.set_state(AdminStates.multi_link_processing)
-    await state.update_data(
-        detected_links=links,
-        current_link_index=0,
-        total_links=len(links),
-        added_count=0
-    )
-    await ask_link_categorization(message, state, duplicate_confirmed=False)
-
-@router.message(IsAdmin(), F.document, ~StateFilter(UploaderStates.uploading_videos, UploaderStates.waiting_for_category))
-async def handle_document_links(message: Message, state: FSMContext, bot: Bot):
-    if message.document.file_name and message.document.file_name.lower().endswith(".txt"):
-        file_io = io.BytesIO()
-        file = await bot.get_file(message.document.file_id)
-        await bot.download_file(file.file_path, destination=file_io)
-        content = file_io.getvalue().decode("utf-8", errors="ignore")
-        
-        matches = TG_LINK_REGEX.findall(content)
-        if matches:
-            await message.reply(f"📄 Found <code>{len(matches)}</code> Telegram link(s) in uploaded file.", parse_mode="HTML")
-            await start_link_queue_flow(matches, message, state)
-
-@router.message(
-    IsAdmin(),
-    ~StateFilter(UploaderStates.uploading_videos, UploaderStates.waiting_for_category),
-    F.text | F.caption
-)
-async def handle_text_or_caption_links(message: Message, state: FSMContext):
-    text_content = message.text or message.caption or ""
-    if text_content.startswith("/"):
-        return
-
-    current_state = await state.get_state()
-    if current_state in [
-        AdminStates.waiting_for_dest_target.state,
-        AdminStates.waiting_for_dest_custom_delay.state,
-        AdminStates.waiting_for_notif_channel.state,
-        AdminStates.waiting_for_new_category.state,
-        AdminStates.waiting_for_fixed_delay.state,
-        AdminStates.waiting_for_random_delay.state,
-        AdminStates.waiting_for_earning_rate.state,
-        AdminStates.waiting_for_emp_manual_add.state,
-        AdminStates.waiting_for_admin_id.state,
-        AdminStates.waiting_for_req_nickname.state,
-        AdminStates.waiting_for_editor_ref.state,
-        AdminStates.waiting_for_rejection_notes.state,
-        AdminStates.waiting_for_admin_self_edit.state,
-        AdminStates.waiting_for_reedit_title.state
-    ]:
-        return
-
-    matches = TG_LINK_REGEX.findall(text_content)
-    if matches:
-        await start_link_queue_flow(matches, message, state)
-
-async def ask_link_categorization(message_or_call, state: FSMContext, duplicate_confirmed: bool = False, show_urgent_options: bool = False):
-    data = await state.get_data()
-    links = data.get("detected_links", [])
-    index = data.get("current_link_index", 0)
-    total = data.get("total_links", 0)
-
-    if index >= total or index >= len(links):
-        added = data.get("added_count", 0)
-        await state.clear()
-        completion_text = f"🎉 <b>All Links Processed Successfully!</b>\n\nQueued <code>{added}</code> of <code>{total}</code> link(s) for uploaders."
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👑 Back to Admin Menu", callback_data="admin_menu")]
-        ])
-        if isinstance(message_or_call, CallbackQuery):
-            await message_or_call.message.edit_text(completion_text, reply_markup=kb, parse_mode="HTML")
-        else:
-            await message_or_call.answer(completion_text, reply_markup=kb, parse_mode="HTML")
-        return
-
-    raw_url = links[index]
-    clickable_url = make_clickable_url(raw_url)
-
-    if not duplicate_confirmed:
-        existing_link = await fetchrow(
-            "SELECT id, status, video_count FROM links WHERE url = $1 OR url = $2 ORDER BY id DESC LIMIT 1",
-            clickable_url, raw_url
-        )
-        if existing_link:
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="⚠️ Yes, Add This Again", callback_data="mlink_dup_confirm")],
-                [InlineKeyboardButton(text="⏭️ No, Skip This Link", callback_data="mlink_skip")],
-                [InlineKeyboardButton(text="❌ Cancel Remaining", callback_data="mlink_cancel")]
-            ])
-            prompt = (
-                f"⚠️ <b>Duplicate Link Detected ({index + 1}/{total})!</b>\n\n"
-                f'👉 <a href="{clickable_url}"><b>{clickable_url}</b></a>\n\n'
-                f"• <b>Previous Status:</b> <code>{existing_link['status']}</code>\n"
-                f"• <b>Videos Recorded:</b> <code>{existing_link['video_count']}</code>\n\n"
-                "<i>This link was already sent before. Are you sure you want to add this again?</i>"
-            )
-            if isinstance(message_or_call, CallbackQuery):
-                await message_or_call.message.edit_text(prompt, reply_markup=kb, parse_mode="HTML")
-            else:
-                await message_or_call.reply(prompt, reply_markup=kb, parse_mode="HTML")
-            return
-
-    if show_urgent_options:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🚨 Urgent Downloadable", callback_data="mlink_cat:Downloadable:1"),
-                InlineKeyboardButton(text="🚨 Urgent Forwardable", callback_data="mlink_cat:Forwardable:1")
-            ],
-            [InlineKeyboardButton(text="🔙 Back to Normal Options", callback_data="mlink_back_normal")]
-        ])
-        prompt = (
-            f"🚨 <b>Mark Link as URGENT ({index + 1}/{total}):</b>\n"
-            f'👉 <a href="{clickable_url}"><b>{clickable_url}</b></a>\n\n'
-            "<i>(Urgent links are placed at the absolute front of the queue ahead of all other links)</i>\n\n"
-            "Select the link type for this urgent task:"
-        )
-    else:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📥 Downloadable", callback_data="mlink_cat:Downloadable:0"),
-                InlineKeyboardButton(text="⏩ Forwardable", callback_data="mlink_cat:Forwardable:0")
-            ],
-            [
-                InlineKeyboardButton(text="🚨 URGENT (Priority Queue)", callback_data="mlink_urgent_menu")
-            ],
-            [
-                InlineKeyboardButton(text="⏭️ Skip Link", callback_data="mlink_skip"),
-                InlineKeyboardButton(text="❌ Cancel Remaining", callback_data="mlink_cancel")
-            ]
-        ])
-        prompt = (
-            f"🔗 <b>Categorize Link ({index + 1}/{total}):</b>\n"
-            f'👉 <a href="{clickable_url}"><b>{clickable_url}</b></a>\n\n'
-            "Please categorize this link for the uploaders queue:"
-        )
-
-    if isinstance(message_or_call, CallbackQuery):
-        await message_or_call.message.edit_text(prompt, reply_markup=kb, parse_mode="HTML")
-    else:
-        await message_or_call.reply(prompt, reply_markup=kb, parse_mode="HTML")
-
-@router.callback_query(AdminStates.multi_link_processing, F.data == "mlink_urgent_menu")
-async def cb_mlink_urgent_menu(call: CallbackQuery, state: FSMContext):
-    await ask_link_categorization(call, state, duplicate_confirmed=True, show_urgent_options=True)
-    await call.answer()
-
-@router.callback_query(AdminStates.multi_link_processing, F.data == "mlink_back_normal")
-async def cb_mlink_back_normal(call: CallbackQuery, state: FSMContext):
-    await ask_link_categorization(call, state, duplicate_confirmed=True, show_urgent_options=False)
-    await call.answer()
-
-@router.callback_query(AdminStates.multi_link_processing, F.data.startswith("mlink_cat:"))
-async def process_multi_link_choice(call: CallbackQuery, state: FSMContext, bot: Bot):
-    parts = call.data.split(":")
-    link_type = parts[1]
-    is_urgent = bool(int(parts[2])) if len(parts) > 2 else False
-
-    data = await state.get_data()
-    links = data.get("detected_links", [])
-    index = data.get("current_link_index", 0)
-    added = data.get("added_count", 0)
-
-    raw_url = links[index]
-    clickable_url = make_clickable_url(raw_url)
-
-    await execute(
-        "INSERT INTO links (url, link_type, is_urgent, status) VALUES ($1, $2, $3, 'pending')",
-        clickable_url, link_type, is_urgent
-    )
-    await state.update_data(current_link_index=index + 1, added_count=added + 1)
-
-    urg_label = " 🚨 [URGENT]" if is_urgent else ""
-    await send_notification_log(
-        bot,
-        f"🔗 <b>[Link Added to Queue{urg_label}]</b>\n"
-        f"• <b>URL:</b> {clickable_url}\n"
-        f"• <b>Type:</b> <code>{link_type}</code>\n"
-        f"• <b>Priority:</b> {'High (First in Queue)' if is_urgent else 'Standard'}"
-    )
-
-    await call.answer(f"Added as {link_type} (Urgent: {is_urgent})!")
-    await ask_link_categorization(call, state, duplicate_confirmed=False)
-
-@router.callback_query(AdminStates.multi_link_processing, F.data == "mlink_dup_confirm")
-async def process_multi_link_dup_confirm(call: CallbackQuery, state: FSMContext):
-    await call.answer("Duplicate confirmed. Categorize link:")
-    await ask_link_categorization(call, state, duplicate_confirmed=True)
-
-@router.callback_query(AdminStates.multi_link_processing, F.data == "mlink_skip")
-async def process_multi_link_skip(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    index = data.get("current_link_index", 0)
-    await state.update_data(current_link_index=index + 1)
-    await call.answer("Link skipped!")
-    await ask_link_categorization(call, state, duplicate_confirmed=False)
-
-@router.callback_query(AdminStates.multi_link_processing, F.data == "mlink_cancel")
-async def process_multi_link_cancel(call: CallbackQuery, state: FSMContext):
-    data = await state.get_data()
-    added = data.get("added_count", 0)
-    await state.clear()
-    await call.message.edit_text(
-        f"❌ <b>Queue setup cancelled.</b>\nAdded <code>{added}</code> link(s) before cancellation.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👑 Admin Menu", callback_data="admin_menu")]
-        ]),
-        parse_mode="HTML"
-    )
