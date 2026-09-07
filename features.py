@@ -30,6 +30,8 @@ db_pool: asyncpg.Pool = None
 # Trackers for live progress messages
 broadcast_notif_tracker: dict[str, int] = {}
 flezen_conf_tracker: dict[int, int] = {}
+sorter_notif_tracker: dict[int, int] = {}
+sorter_notif_lock = asyncio.Lock()
 
 # Regex matching Telegram channel, group, private join, and message links
 TG_LINK_REGEX = re.compile(
@@ -196,7 +198,6 @@ class LiveUploadManager:
             [InlineKeyboardButton(text="⚠️ Link Expired (Report to Admin)", callback_data=f"uploader_expired:{link_id}")]
         ])
 
-        # Delete older counter messages in uploader chat
         old_ids = sess["user_msg_ids"][:]
         sess["user_msg_ids"] = []
         for oid in old_ids:
@@ -474,7 +475,6 @@ async def init_db():
             await conn.execute("ALTER TABLE editor_tasks ADD COLUMN IF NOT EXISTS submitted_at TIMESTAMPTZ;")
             await conn.execute("ALTER TABLE editor_tasks ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;")
 
-            # Automatically rescue existing stuck videos into the sorter queue
             await conn.execute("""
                 UPDATE videos
                 SET status = 'pending_sort'
@@ -762,12 +762,22 @@ async def start_editor_task(user_id: int, message: Message, state: FSMContext, b
     else:
         await message.answer(f"🔗 <b>Reference Content / Link:</b>\n{task['ref_content']}\n\n{prompt_caption}", parse_mode="HTML")
 
+# ---------------------------------------------------------------------------
+# UPDATED: 6 CATEGORY BUTTONS IN QUICK PICK (2 PER ROW)
+# ---------------------------------------------------------------------------
 async def build_sorter_category_kb(vid_id: int) -> InlineKeyboardMarkup:
-    recent_cats = await fetch("SELECT name FROM categories ORDER BY last_used_at DESC NULLS LAST, use_count DESC LIMIT 2")
+    recent_cats = await fetch(
+        "SELECT name FROM categories ORDER BY last_used_at DESC NULLS LAST, use_count DESC LIMIT 6"
+    )
     buttons = []
+    row = []
 
-    if recent_cats:
-        row = [InlineKeyboardButton(text=f"⚡ {rc['name']}", callback_data=f"sort_pick:{vid_id}:{rc['name']}") for rc in recent_cats]
+    for rc in recent_cats:
+        row.append(InlineKeyboardButton(text=f"⚡ {rc['name']}", callback_data=f"sort_pick:{vid_id}:{rc['name']}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
         buttons.append(row)
 
     buttons.append([InlineKeyboardButton(text="📂 Show More Categories", callback_data=f"sort_more:{vid_id}")])
@@ -960,7 +970,7 @@ async def cb_set_chat_dest(call: CallbackQuery, bot: Bot):
     await call.answer("Destination linked successfully!")
 
 # ---------------------------------------------------------------------------
-# BACKGROUND BROADCASTER (DECOUPLED FROM SORTER QUEUE)
+# BACKGROUND BROADCASTER
 # ---------------------------------------------------------------------------
 async def broadcast_worker(bot: Bot):
     while True:
@@ -2158,7 +2168,7 @@ async def process_video_upload(message: Message, state: FSMContext, bot: Bot):
         await upload_manager.log_duplicate_attempt(bot, link_id, user_id, nick, message.chat.id)
         return
 
-    # Valid video upload - saved with posted_at = NULL
+    # Valid video upload
     await execute(
         "INSERT INTO videos (link_id, uploader_id, file_id, file_unique_id, caption, status, created_at) VALUES ($1, $2, $3, $4, $5, 'pending_broadcast', NOW())",
         link_id, user_id, file_id, file_unique_id, caption
@@ -3335,9 +3345,15 @@ async def cb_sort_skip(call: CallbackQuery, state: FSMContext, bot: Bot):
     vid_id = int(call.data.split(":")[1])
     await execute("UPDATE videos SET status = 'pending_sort', sorter_id = NULL WHERE id = $1", vid_id)
     await call.answer("Video returned to queue.")
-    await call.message.delete()
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
     await sorter_fetch_next_task(call.from_user.id, call.message, state, bot)
 
+# ---------------------------------------------------------------------------
+# UPDATED: AUTOMATIC NEXT VIDEO DISPATCH & SINGLE LOG MESSAGE PER SORTER
+# ---------------------------------------------------------------------------
 @router.callback_query(F.data.startswith("sort_pick:"))
 async def cb_sort_pick(call: CallbackQuery, state: FSMContext, bot: Bot):
     parts = call.data.split(":")
@@ -3394,25 +3410,47 @@ async def cb_sort_pick(call: CallbackQuery, state: FSMContext, bot: Bot):
         except Exception as e:
             logging.error(f"Error forwarding to 2nd Layer {sl['target_chat']}: {e}")
 
-    await send_notification_log(
-        bot,
-        f"🏷️ <b>[Video Sorted & Distributed]</b>\n"
-        f"• <b>Sorter:</b> {sorter_nick} (<code>{user_id}</code>)\n"
-        f"• <b>Video ID:</b> <code>#{vid_id}</code>\n"
-        f"• <b>Category:</b> <code>{chosen_cat}</code>\n"
-        f"• Forwarded to 1st Layer & 2nd Layer (Verifier)"
-    )
+    # Single updated message for Notification Log Channel per sorter
+    s_today = await fetchval("SELECT COUNT(*) FROM videos WHERE sorter_id = $1 AND sorted_at >= CURRENT_DATE", user_id) or 1
+    async with sorter_notif_lock:
+        log_channel = await get_setting("notification_log_channel", "") or os.getenv("NOTIFICATION_LOG_CHANNEL", "")
+        if log_channel:
+            target_log_chat = int(log_channel) if log_channel.lstrip('-').isdigit() else log_channel
+            prev_msg_id = sorter_notif_tracker.get(user_id)
+            if prev_msg_id:
+                try:
+                    await bot.delete_message(chat_id=target_log_chat, message_id=prev_msg_id)
+                except Exception:
+                    pass
 
-    next_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➡️ Next Video", callback_data="sorter_next_task")]
-    ])
+            notif_msg = await send_notification_log(
+                bot,
+                f"🏷️ <b>[Live Sorting In Progress]</b>\n"
+                f"• <b>Sorter:</b> {sorter_nick} (<code>{user_id}</code>)\n"
+                f"• <b>Latest Category:</b> <code>{chosen_cat}</code> (Video #{vid_id})\n"
+                f"• <b>Videos Sorted Today:</b> <code>{s_today}</code>\n"
+                f"• Forwarded to 1st Layer & 2nd Layer (Verifier)"
+            )
+            if notif_msg:
+                sorter_notif_tracker[user_id] = notif_msg.message_id
 
-    await call.message.edit_caption(
-        caption=f"✅ <b>Categorized as:</b> <code>{chosen_cat}</code>\nDelivered to 1st Layer and 2nd Layer Groups!",
-        reply_markup=next_kb,
-        parse_mode="HTML"
-    )
+    # Remove buttons from the categorized video
+    try:
+        await call.message.edit_caption(
+            caption=f"✅ <b>Categorized as:</b> <code>{chosen_cat}</code> (Forwarded)",
+            reply_markup=None,
+            parse_mode="HTML"
+        )
+    except Exception:
+        try:
+            await call.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
     await call.answer(f"Saved as {chosen_cat}!")
+
+    # Automatically dispatch the next task to the sorter
+    await sorter_fetch_next_task(user_id, call.message, state, bot)
 
 # ---------------------------------------------------------------------------
 # 2ND LAYER VERIFIER INTERACTIONS
